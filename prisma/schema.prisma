@@ -1,0 +1,40 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Player {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  rating      Int      @default(1000)
+  wins        Int      @default(0)
+  losses      Int      @default(0)
+  gamesPlayed Int      @default(0)
+  ballsPotted Int      @default(0)
+  bestStreak  Int      @default(0)
+  currentStreak Int    @default(0)
+  isBot       Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([rating])
+}
+
+model Match {
+  id           String   @id // client-generated matchId, used for dedupe
+  mode         String   // 'bot' | 'online' | 'quick'
+  winnerName   String
+  loserName    String
+  winnerDelta  Int      @default(0)
+  loserDelta   Int      @default(0)
+  winnerBalls  Int      @default(0)
+  loserBalls   Int      @default(0)
+  durationSec  Int      @default(0)
+  createdAt    DateTime @default(now())
+
+  @@index([createdAt])
+}

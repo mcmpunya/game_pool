@@ -1,0 +1,752 @@
+     1→'use client'
+     2→
+     3→// Game orchestrator: owns the PoolGame engine, HUD, sounds, bot turns,
+     4→// online sync and match recording (ELO).
+     5→import { useCallback, useEffect, useRef, useState } from 'react'
+     6→import { Volume2, VolumeX, Trophy } from 'lucide-react'
+     7→import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from '@/components/ui/alert-dialog'
+     8→import { Badge } from '@/components/ui/badge'
+     9→import { Button } from '@/components/ui/button'
+    10→import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+    11→import { useToast } from '@/hooks/use-toast'
+    12→import { Group, PlayerInfo, ballType } from '@/lib/game/constants'
+    13→import { PoolGame, type ShotSettledInfo } from '@/lib/game/engine'
+    14→import { BOT_THINK_MS, botDecide } from '@/lib/game/bot'
+    15→import { GameSyncPayload, getSocket } from '@/lib/game/net'
+    16→import { isMuted, setMuted, unlockAudio } from '@/lib/game/sound'
+    17→import PoolTable from './PoolTable'
+    18→
+    19→export interface GameConfig {
+    20→  mode: 'bot' | 'local' | 'online'
+    21→  botDifficulty?: 'easy' | 'medium' | 'hard'
+    22→  online?: { seat: 0 | 1; roomCode: string; opponentName: string }
+    23→}
+    24→
+    25→interface GameScreenProps {
+    26→  playerName: string
+    27→  playerTwoName: string
+    28→  config: GameConfig
+    29→  onExit: () => void
+    30→  onViewLeaderboard: () => void
+    31→  onMatchRecorded: () => void
+    32→}
+    33→
+    34→interface GameOverState {
+    35→  winner: 0 | 1
+    36→  reason: string
+    37→  record: {
+    38→    myDelta: number | null
+    39→    newRating: number | null
+    40→    opponentDelta: number | null
+    41→  } | null
+    42→}
+    43→
+    44→interface RecordResult {
+    45→  winner: { name: string; rating: number; delta: number }
+    46→  loser: { name: string; rating: number; delta: number }
+    47→}
+    48→
+    49→const BOT_NAMES: Record<string, string> = {
+    50→  easy: 'Rookie Bot',
+    51→  medium: 'Sharpshooter Bot',
+    52→  hard: 'Grandmaster Bot',
+    53→}
+    54→
+    55→export default function GameScreen({ playerName, playerTwoName, config, onExit, onViewLeaderboard, onMatchRecorded }: GameScreenProps) {
+    56→  const { toast } = useToast()
+    57→  const gameRef = useRef<PoolGame | null>(null)
+    58→  if (!gameRef.current) {
+    59→    const players = makePlayers(config, playerName, playerTwoName)
+    60→    gameRef.current = new PoolGame(players, 0)
+    61→  }
+    62→  const [, setVersion] = useState(0)
+    63→  const bump = useCallback(() => setVersion((v) => v + 1), [])
+    64→
+    65→  const [ratings, setRatings] = useState<Record<string, number>>({})
+    66→  const [mutedState, setMutedState] = useState(false)
+    67→  const [gameOver, setGameOver] = useState<GameOverState | null>(null)
+    68→  const [confirmExit, setConfirmExit] = useState(false)
+    69→  const [synced, setSynced] = useState(config.mode !== 'online' || config.online!.seat === 0)
+    70→  const [opponentLeft, setOpponentLeft] = useState<string | null>(null)
+    71→  const [rematchOffer, setRematchOffer] = useState<string | null>(null)
+    72→  const [waitingRematch, setWaitingRematch] = useState(false)
+    73→  const [chatBubble, setChatBubble] = useState<string | null>(null)
+    74→
+    75→  const pottedByRef = useRef<[number, number]>([0, 0])
+    76→  const startRef = useRef(Date.now())
+    77→  const recordedRef = useRef(false)
+    78→  const pendingSyncRef = useRef<GameSyncPayload | null>(null)
+    79→  const botTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+    80→  const breakerRef = useRef<0 | 1>(0)
+    81→  const gameRefStable = gameRef as React.MutableRefObject<PoolGame>
+    82→
+    83→  const seat = config.mode === 'online' ? config.online!.seat : 0
+    84→  const isHost = config.mode !== 'online' || seat === 0
+    85→
+    86→  // ---------- sounds ----------
+    87→  useEffect(() => {
+    88→    const g = gameRef.current
+    89→    if (!g) return
+    90→    g.simCallbacks = {
+    91→      onBallHit: (speed) => void import('@/lib/game/sound').then((m) => m.playBallHit(speed)),
+    92→      onCushion: (speed) => void import('@/lib/game/sound').then((m) => m.playCushion(speed)),
+    93→      onPot: () => void import('@/lib/game/sound').then((m) => m.playPocket()),
+    94→    }
+    95→  }, [])
+    96→
+    97→  // ---------- match recording ----------
+    98→  const recordMatch = useCallback(
+    99→    async (winner: 0 | 1, reason: string) => {
+   100→      if (config.mode === 'local' || recordedRef.current) return
+   101→      recordedRef.current = true
+   102→      const g = gameRef.current!
+   103→      const winnerName = g.players[winner].name
+   104→      const loserName = g.players[1 - winner].name
+   105→      const winnerBalls = Math.min(8, pottedByRef.current[winner] + (reason.includes('8-ball') ? 1 : 0))
+   106→      const loserBalls = Math.min(8, pottedByRef.current[1 - winner])
+   107→      const durationSec = Math.round((Date.now() - startRef.current) / 1000)
+   108→      const matchId = typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`
+   109→      try {
+   110→        const res = await fetch('/api/matches', {
+   111→          method: 'POST',
+   112→          headers: { 'Content-Type': 'application/json' },
+   113→          body: JSON.stringify({
+   114→            matchId,
+   115→            mode: config.mode === 'bot' ? 'bot' : 'online',
+   116→            winnerName,
+   117→            loserName,
+   118→            winnerBalls,
+   119→            loserBalls,
+   120→            durationSec,
+   121→          }),
+   122→        })
+   123→        const data = (await res.json()) as { ok?: boolean; winner?: RecordResult['winner']; loser?: RecordResult['loser'] }
+   124→        const myName = config.mode === 'bot' ? playerName : undefined
+   125→        let myDelta: number | null = null
+   126→        let newRating: number | null = null
+   127→        if (config.mode === 'bot' && data.winner && data.loser) {
+   128→          const mine = data.winner.name === myName ? data.winner : data.loser
+   129→          myDelta = mine.delta
+   130→          newRating = mine.rating
+   131→        }
+   132→        setGameOver({
+   133→          winner,
+   134→          reason,
+   135→          record: { myDelta, newRating, opponentDelta: null },
+   136→        })
+   137→        if (data.ok) onMatchRecorded()
+   138→      } catch {
+   139→        setGameOver({ winner, reason, record: null })
+   140→      }
+   141→    },
+   142→    [config.mode, config.online, onMatchRecorded, playerName]
+   143→  )
+   144→
+   145→  // ---------- bot scheduling ----------
+   146→  const scheduleBot = useCallback(() => {
+   147→    if (config.mode !== 'bot') return
+   148→    const difficulty = config.botDifficulty ?? 'medium'
+   149→    if (botTimerRef.current) clearTimeout(botTimerRef.current)
+   150→    const g = gameRef.current
+   151→    if (!g || g.simulating || g.rules.phase === 'over') return
+   152→    if (g.rules.turn !== 1) return
+   153→    botTimerRef.current = setTimeout(() => {
+   154→      const g2 = gameRef.current
+   155→      if (!g2 || g2.simulating || g2.rules.phase === 'over' || g2.rules.turn !== 1) return
+   156→      unlockAudio()
+   157→      const decision = botDecide(g2.rules, g2.balls, difficulty)
+   158→      if (decision.placeCue) g2.placeCue(decision.placeCue.x, decision.placeCue.y)
+   159→      g2.shoot(decision.angle, decision.power)
+   160→      bump()
+   161→    }, BOT_THINK_MS(difficulty))
+   162→  }, [bump, config.botDifficulty, config.mode])
+   163→
+   164→  // ---------- shot settled ----------
+   165→  const handleSettled = useCallback(
+   166→    (info: ShotSettledInfo) => {
+   167→      const g = gameRef.current
+   168→      if (!g) return
+   169→      for (const id of info.events.potted) {
+   170→        if (id !== 8 && id !== 0) pottedByRef.current[info.shooter]++
+   171→      }
+   172→
+   173→      // online sync
+   174→      if (config.mode === 'online') {
+   175→        const s = getSocket()
+   176→        if (isHost) {
+   177→          s.emit('shot-result', {
+   178→            balls: g.balls.map((b) => ({ ...b })),
+   179→            rules: { ...g.rules },
+   180→            lastShot: {
+   181→              shooter: info.shooter,
+   182→              potted: info.events.potted,
+   183→              foul: info.rules.foul,
+   184→              foulReason: info.rules.foulReason,
+   185→            },
+   186→          })
+   187→        } else if (pendingSyncRef.current) {
+   188→          const p = pendingSyncRef.current
+   189→          pendingSyncRef.current = null
+   190→          g.applySync(p.balls, p.rules)
+   191→        }
+   192→      }
+   193→
+   194→      if (info.rules.phase === 'over' && info.rules.winner !== null) {
+   195→        void recordMatch(info.rules.winner, info.rules.winReason ?? 'Won the game')
+   196→        if (!recordedRef.current) setGameOver({ winner: info.rules.winner, reason: info.rules.winReason ?? 'Won the game', record: null })
+   197→        // recordMatch sets gameOver again with deltas; ensure immediate UI too
+   198→      } else {
+   199→        scheduleBot()
+   200→      }
+   201→      bump()
+   202→    },
+   203→    [bump, config.mode, isHost, recordMatch, scheduleBot]
+   204→  )
+   205→
+   206→  useEffect(() => {
+   207→    const g = gameRef.current
+   208→    if (g) g.onShotSettled = handleSettled
+   209→  }, [handleSettled])
+   210→
+   211→  // ---------- ratings lookup (keyed by name — seat order can swap after sync) ----------
+   212→  const fetchRatings = useCallback((names: string[]) => {
+   213→    void Promise.all(
+   214→      names.map(async (n) => {
+   215→        try {
+   216→          const res = await fetch(`/api/players?name=${encodeURIComponent(n)}`)
+   217→          const data = (await res.json()) as { player: { rating: number } | null }
+   218→          if (data.player) {
+   219→            setRatings((prev) => ({ ...prev, [n]: data.player!.rating }))
+   220→          }
+   221→        } catch {
+   222→          /* ignore */
+   223→        }
+   224→      })
+   225→    )
+   226→  }, [])
+   227→
+   228→  useEffect(() => {
+   229→    if (config.mode === 'local') return
+   230→    const g = gameRef.current
+   231→    if (!g) return
+   232→    fetchRatings([g.players[0].name, g.players[1].name])
+   233→  }, [config.mode, fetchRatings])
+   234→
+   235→  // ---------- online wiring ----------
+   236→  useEffect(() => {
+   237→    if (config.mode !== 'online') return
+   238→    const s = getSocket()
+   239→    const g = gameRef.current
+   240→
+   241→    const sendHostState = () => {
+   242→      const g2 = gameRef.current
+   243→      if (g2 && seat === 0) {
+   244→        s.emit('host-state', {
+   245→          balls: g2.balls.map((b) => ({ ...b })),
+   246→          rules: { ...g2.rules },
+   247→          players: g2.players.map((p) => ({ name: p.name, isBot: false })),
+   248→        })
+   249→      }
+   250→    }
+   251→    // host announces the initial state on mount (harmless if the guest is not
+   252→    // ready yet) and again when the guest signals it is up
+   253→    sendHostState()
+   254→
+   255→    const onOpponentShot = (data: { angle: number; power: number }) => {
+   256→      const g2 = gameRef.current
+   257→      if (!g2 || g2.simulating || g2.rules.phase === 'over') return
+   258→      unlockAudio()
+   259→      g2.shoot(data.angle, data.power)
+   260→      bump()
+   261→    }
+   262→    const onGameSync = (data: GameSyncPayload) => {
+   263→      const g2 = gameRef.current
+   264→      if (!g2) return
+   265→      if (g2.simulating) {
+   266→        pendingSyncRef.current = data
+   267→      } else {
+   268→        g2.applySync(data.balls, data.rules)
+   269→      }
+   270→      bump()
+   271→    }
+   272→    const onCuePlaced = (data: { x: number; y: number }) => {
+   273→      const g2 = gameRef.current
+   274→      if (!g2) return
+   275→      g2.placeCue(data.x, data.y)
+   276→      bump()
+   277→    }
+   278→    const onOpponentLeft = (data: { message: string }) => {
+   279→      setOpponentLeft(data.message || 'Opponent left the match')
+   280→    }
+   281→    const onRematchOffered = (data: { from: string }) => {
+   282→      setRematchOffer(data.from)
+   283→      setWaitingRematch(false)
+   284→    }
+   285→    const onRematchStarted = () => {
+   286→      if (seat === 0) {
+   287→        const g2 = gameRef.current
+   288→        if (g2) {
+   289→          const nextBreaker: 0 | 1 = breakerRef.current === 0 ? 1 : 0
+   290→          breakerRef.current = nextBreaker
+   291→          g2.rack(nextBreaker)
+   292→          s.emit('host-state', {
+   293→            balls: g2.balls.map((b) => ({ ...b })),
+   294→            rules: { ...g2.rules },
+   295→            players: g2.players.map((p) => ({ name: p.name, isBot: false })),
+   296→          })
+   297→        }
+   298→      }
+   299→      setGameOver(null)
+   300→      setWaitingRematch(false)
+   301→      setRematchOffer(null)
+   302→      recordedRef.current = false
+   303→      pottedByRef.current = [0, 0]
+   304→      startRef.current = Date.now()
+   305→      bump()
+   306→    }
+   307→    const onGameStart = (data: GameSyncPayload & { players?: { name: string; isBot: boolean }[] }) => {
+   308→      const g2 = gameRef.current
+   309→      if (!g2) return
+   310→      if (data.players) {
+   311→        g2.players = [data.players[0], data.players[1]] as [PlayerInfo, PlayerInfo]
+   312→        fetchRatings([g2.players[0].name, g2.players[1].name])
+   313→      }
+   314→      g2.applySync(data.balls, data.rules)
+   315→      setSynced(true)
+   316→      setGameOver(null)
+   317→      recordedRef.current = false
+   318→      pottedByRef.current = [0, 0]
+   319→      startRef.current = Date.now()
+   320→      bump()
+   321→    }
+   322→    const onChat = (data: { from: string; text: string }) => {
+   323→      setChatBubble(`${data.from}: ${data.text}`)
+   324→      setTimeout(() => setChatBubble(null), 3500)
+   325→    }
+   326→
+   327→    const onGuestReady = () => sendHostState()
+   328→
+   329→    s.on('opponent-shot', onOpponentShot)
+   330→    s.on('game-sync', onGameSync)
+   331→    s.on('cue-placed', onCuePlaced)
+   332→    s.on('opponent-left', onOpponentLeft)
+   333→    s.on('rematch-offered', onRematchOffered)
+   334→    s.on('rematch-started', onRematchStarted)
+   335→    s.on('game-start', onGameStart)
+   336→    s.on('chat', onChat)
+   337→    s.on('guest-ready', onGuestReady)
+   338→    if (seat === 1) s.emit('guest-ready')
+   339→    return () => {
+   340→      s.off('opponent-shot', onOpponentShot)
+   341→      s.off('game-sync', onGameSync)
+   342→      s.off('cue-placed', onCuePlaced)
+   343→      s.off('opponent-left', onOpponentLeft)
+   344→      s.off('rematch-offered', onRematchOffered)
+   345→      s.off('rematch-started', onRematchStarted)
+   346→      s.off('game-start', onGameStart)
+   347→      s.off('chat', onChat)
+   348→      s.off('guest-ready', onGuestReady)
+   349→    }
+   350→  }, [bump, config.mode, fetchRatings, seat])
+   351→
+   352→  // schedule the bot on mount as well (e.g. after rematch where bot breaks)
+   353→  useEffect(() => {
+   354→    scheduleBot()
+   355→    return () => {
+   356→      if (botTimerRef.current) clearTimeout(botTimerRef.current)
+   357→    }
+   358→  }, [scheduleBot])
+   359→
+   360→  // ---------- actions ----------
+   361→  const myTurnInteractive = (() => {
+   362→    const g = gameRef.current
+   363→    if (!g || g.simulating || g.rules.phase === 'over' || opponentLeft || !synced) return false
+   364→    if (config.mode === 'local') return true
+   365→    return g.rules.turn === seat
+   366→  })()
+   367→
+   368→  const handleShoot = useCallback(
+   369→    (angle: number, power: number) => {
+   370→      const g = gameRef.current
+   371→      if (!g) return
+   372→      if (g.shoot(angle, power)) {
+   373→        if (config.mode === 'online') getSocket().emit('shot', { angle, power })
+   374→        bump()
+   375→      }
+   376→    },
+   377→    [bump, config.mode]
+   378→  )
+   379→
+   380→  const handlePlaceCue = useCallback(
+   381→    (x: number, y: number) => {
+   382→      const g = gameRef.current
+   383→      if (!g) return
+   384→      if (g.placeCue(x, y)) {
+   385→        if (config.mode === 'online') getSocket().emit('place-cue', { x, y })
+   386→        bump()
+   387→      }
+   388→    },
+   389→    [bump, config.mode]
+   390→  )
+   391→
+   392→  const handleRematch = useCallback(() => {
+   393→    const g = gameRef.current
+   394→    if (!g) return
+   395→    if (config.mode === 'online') {
+   396→      getSocket().emit('rematch-offer')
+   397→      setWaitingRematch(true)
+   398→      return
+   399→    }
+   400→    // local / bot: winner breaks
+   401→    const breaker = (gameOver?.winner ?? 0) as 0 | 1
+   402→    breakerRef.current = breaker
+   403→    g.rack(breaker)
+   404→    pottedByRef.current = [0, 0]
+   405→    startRef.current = Date.now()
+   406→    recordedRef.current = false
+   407→    setGameOver(null)
+   408→    setRatings((r) => config.mode === 'bot' ? r : [null, null])
+   409→    scheduleBot()
+   410→    bump()
+   411→  }, [bump, config.mode, gameOver, scheduleBot])
+   412→
+   413→  const acceptRematch = useCallback(() => {
+   414→    getSocket().emit('rematch-accept')
+   415→    setRematchOffer(null)
+   416→    setWaitingRematch(true)
+   417→  }, [])
+   418→
+   419→  const handleExit = useCallback(() => {
+   420→    if (config.mode === 'online') {
+   421→      getSocket().emit('leave-room')
+   422→    }
+   423→    onExit()
+   424→  }, [config.mode, onExit])
+   425→
+   426→  const toggleMute = useCallback(() => {
+   427→    const next = !isMuted()
+   428→    setMuted(next)
+   429→    setMutedState(next)
+   430→  }, [])
+   431→
+   432→  // ---------- HUD data ----------
+   433→  const g = gameRef.current!
+   434→  const rules = g.rules
+   435→  const players = g.players
+   436→  const myIndex = seat
+   437→  const over = rules.phase === 'over'
+   438→
+   439→  const remaining = (grp: Group | null): number => {
+   440→    if (!grp) return 0
+   441→    return g.balls.filter((b) => b.active && ballType(b.id) === grp).length
+   442→  }
+   443→
+   444→  return (
+   445→    <div className="flex h-[100dvh] w-full flex-col bg-[#0c1f17] text-white" style={{ paddingTop: 'env(safe-area-inset-top)' }}>
+   446→      {/* score bar */}
+   447→      <div className="flex items-stretch gap-2 px-2 pt-2 sm:px-4">
+   448→        <PlayerCard
+   449→          name={players[0].name}
+   450→          rating={ratings[players[0].name] ?? null}
+   451→          group={rules.groups[0]}
+   452→          remaining={remaining(rules.groups[0])}
+   453→          active={rules.turn === 0 && !over}
+   454→          isMe={config.mode !== 'local' ? seat === 0 : false}
+   455→          onBreak={rules.phase === 'break' && rules.turn === 0}
+   456→        />
+   457→        <div className="flex flex-col items-center justify-center px-1">
+   458→          <span className="text-[10px] uppercase tracking-wider text-white/50">8-Ball</span>
+   459→          {config.mode === 'online' && (
+   460→            <Badge variant="outline" className="mt-0.5 border-white/20 font-mono text-[10px] text-white/70">
+   461→              {config.online!.roomCode}
+   462→            </Badge>
+   463→          )}
+   464→          {config.mode === 'bot' && (
+   465→            <Badge variant="outline" className="mt-0.5 border-white/20 text-[10px] capitalize text-white/70">
+   466→              {config.botDifficulty} bot
+   467→            </Badge>
+   468→          )}
+   469→        </div>
+   470→        <PlayerCard
+   471→          name={players[1].name}
+   472→          rating={ratings[players[1].name] ?? null}
+   473→          group={rules.groups[1]}
+   474→          remaining={remaining(rules.groups[1])}
+   475→          active={rules.turn === 1 && !over}
+   476→          isMe={config.mode !== 'local' ? seat === 1 : false}
+   477→          onBreak={rules.phase === 'break' && rules.turn === 1}
+   478→        />
+   479→      </div>
+   480→
+   481→      {/* message strip */}
+   482→      <div className="flex min-h-[28px] items-center justify-center px-3 py-1 text-center text-xs font-medium text-emerald-200/90 sm:text-sm">
+   483→        {over ? (
+   484→          <span className="font-semibold text-amber-300">{players[rules.winner ?? 0].name} wins — {rules.winReason}</span>
+   485→        ) : rules.foul && rules.foulReason ? (
+   486→          <span className="text-red-300">{rules.foulReason} — ball in hand</span>
+   487→        ) : rules.message ? (
+   488→          <span>{rules.message}</span>
+   489→        ) : rules.ballInHand ? (
+   490→          <span className="text-emerald-200/80">Ball in hand — tap the table to place the cue ball</span>
+   491→        ) : (
+   492→          <span className="text-white/60">{players[rules.turn].name}&apos;s turn — drag anywhere to aim, release to shoot</span>
+   493→        )}
+   494→      </div>
+   495→
+   496→      {/* table */}
+   497→      <div className="relative min-h-0 flex-1 px-1 pb-1 sm:px-3 sm:pb-3">
+   498→        <PoolTable
+   499→          gameRef={gameRefStable}
+   500→          interactive={myTurnInteractive}
+   501→          ballInHand={rules.ballInHand && myTurnInteractive}
+   502→          kitchenOnly={rules.kitchenOnly}
+   503→          onShoot={handleShoot}
+   504→          onPlaceCue={handlePlaceCue}
+   505→        />
+   506→        {config.mode === 'online' && !synced && (
+   507→          <div className="absolute inset-0 flex items-center justify-center bg-black/60">
+   508→            <div className="flex flex-col items-center gap-3">
+   509→              <div className="h-8 w-8 animate-spin rounded-full border-2 border-emerald-400 border-t-transparent" />
+   510→              <p className="text-sm text-white/80">Syncing table with host…</p>
+   511→            </div>
+   512→          </div>
+   513→        )}
+   514→        {config.mode === 'bot' && rules.turn === 1 && !over && (
+   515→          <div className="pointer-events-none absolute left-1/2 top-2 -translate-x-1/2 rounded-full bg-black/55 px-3 py-1 text-xs text-white/85">
+   516→            {players[1].name} is thinking…
+   517→          </div>
+   518→        )}
+   519→        {chatBubble && (
+   520→          <div className="pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 rounded-full bg-black/70 px-4 py-1.5 text-sm text-white">
+   521→            {chatBubble}
+   522→          </div>
+   523→        )}
+   524→      </div>
+   525→
+   526→      {/* bottom controls */}
+   527→      <div className="flex items-center justify-between gap-2 px-3 pb-[max(0.5rem,env(safe-area-inset-bottom))]">
+   528→        <Button variant="ghost" size="sm" onClick={toggleMute} aria-label={mutedState ? 'Unmute' : 'Mute'} className="text-white/70 hover:text-white">
+   529→          {mutedState ? <VolumeX className="h-4 w-4" /> : <Volume2 className="h-4 w-4" />}
+   530→          <span className="ml-1">{mutedState ? 'Muted' : 'Sound'}</span>
+   531→        </Button>
+   532→        {config.mode === 'online' && (
+   533→          <div className="flex gap-1.5">
+   534→            {['Nice shot!', 'Good luck!', 'Oops...'].map((preset) => (
+   535→              <Button
+   536→                key={preset}
+   537→                variant="outline"
+   538→                size="sm"
+   539→                className="h-7 border-white/15 bg-black/30 px-2 text-[11px] text-white/80 hover:bg-black/50"
+   540→                onClick={() => getSocket().emit('chat-quick', { preset })}
+   541→              >
+   542→                {preset}
+   543→              </Button>
+   544→            ))}
+   545→          </div>
+   546→        )}
+   547→        <Button variant="ghost" size="sm" onClick={() => setConfirmExit(true)} className="text-white/70 hover:text-white">
+   548→          {config.mode === 'local' ? 'End game' : 'Leave'}
+   549→        </Button>
+   550→      </div>
+   551→
+   552→      {/* exit confirm */}
+   553→      <AlertDialog open={confirmExit} onOpenChange={setConfirmExit}>
+   554→        <AlertDialogContent className="bg-[#122b20] text-white sm:max-w-sm">
+   555→          <AlertDialogHeader>
+   556→            <AlertDialogTitle>Leave this game?</AlertDialogTitle>
+   557→            <AlertDialogDescription className="text-white/70">
+   558→              The current match will be abandoned and won&apos;t be recorded.
+   559→            </AlertDialogDescription>
+   560→          </AlertDialogHeader>
+   561→          <AlertDialogFooter>
+   562→            <AlertDialogCancel className="bg-transparent text-white hover:bg-white/10">Stay</AlertDialogCancel>
+   563→            <AlertDialogAction onClick={handleExit} className="bg-red-600 hover:bg-red-700">
+   564→              Leave
+   565→            </AlertDialogAction>
+   566→          </AlertDialogFooter>
+   567→        </AlertDialogContent>
+   568→      </AlertDialog>
+   569→
+   570→      {/* opponent left */}
+   571→      <AlertDialog open={!!opponentLeft} onOpenChange={(o) => !o && setOpponentLeft(null)}>
+   572→        <AlertDialogContent className="bg-[#122b20] text-white sm:max-w-sm">
+   573→          <AlertDialogHeader>
+   574→            <AlertDialogTitle>Opponent left</AlertDialogTitle>
+   575→            <AlertDialogDescription className="text-white/70">{opponentLeft}</AlertDialogDescription>
+   576→          </AlertDialogHeader>
+   577→          <AlertDialogFooter>
+   578→            <AlertDialogCancel className="hidden" />
+   579→            <AlertDialogAction onClick={handleExit} className="bg-emerald-600 hover:bg-emerald-700">
+   580→              Back to menu
+   581→            </AlertDialogAction>
+   582→          </AlertDialogFooter>
+   583→        </AlertDialogContent>
+   584→      </AlertDialog>
+   585→
+   586→      {/* rematch offer */}
+   587→      <AlertDialog open={!!rematchOffer} onOpenChange={(o) => !o && setRematchOffer(null)}>
+   588→        <AlertDialogContent className="bg-[#122b20] text-white sm:max-w-sm">
+   589→          <AlertDialogHeader>
+   590→            <AlertDialogTitle>Rematch?</AlertDialogTitle>
+   591→            <AlertDialogDescription className="text-white/70">{rematchOffer} wants a rematch.</AlertDialogDescription>
+   592→          </AlertDialogHeader>
+   593→          <AlertDialogFooter>
+   594→            <AlertDialogCancel className="bg-transparent text-white hover:bg-white/10">Decline</AlertDialogCancel>
+   595→            <AlertDialogAction onClick={acceptRematch} className="bg-emerald-600 hover:bg-emerald-700">
+   596→              Accept
+   597→            </AlertDialogAction>
+   598→          </AlertDialogFooter>
+   599→        </AlertDialogContent>
+   600→      </AlertDialog>
+   601→
+   602→      {/* game over */}
+   603→      <Dialog open={!!gameOver && !opponentLeft}>
+   604→        <DialogContent className="border-white/10 bg-[#122b20] text-white sm:max-w-md">
+   605→          {gameOver && (
+   606→            <>
+   607→              <DialogHeader>
+   608→                <DialogTitle className="flex items-center gap-2 text-xl">
+   609→                  <Trophy className="h-6 w-6 text-amber-400" /> {players[gameOver.winner].name} wins!
+   610→                </DialogTitle>
+   611→                <DialogDescription className="text-white/70">{gameOver.reason}</DialogDescription>
+   612→              </DialogHeader>
+   613→              <div className="space-y-2 rounded-lg bg-black/20 p-3 text-sm">
+   614→                <div className="flex justify-between">
+   615→                  <span className="text-white/60">Balls potted</span>
+   616→                  <span>
+   617→                    {players[0].name}: <b>{pottedByRef.current[0]}</b> · {players[1].name}: <b>{pottedByRef.current[1]}</b>
+   618→                  </span>
+   619→                </div>
+   620→                <div className="flex justify-between">
+   621→                  <span className="text-white/60">Duration</span>
+   622→                  <span>{Math.max(1, Math.round((Date.now() - startRef.current) / 1000))}s</span>
+   623→                </div>
+   624→                {config.mode !== 'local' && gameOver.record?.myDelta !== null && config.mode === 'bot' && (
+   625→                  <div className="flex justify-between text-emerald-300">
+   626→                    <span>Rating change</span>
+   627→                    <span>
+   628→                      {gameOver.record?.newRating} ({gameOver.record && gameOver.record.myDelta! >= 0 ? '+' : ''}
+   629→                      {gameOver.record?.myDelta})
+   630→                    </span>
+   631→                  </div>
+   632→                )}
+   633→                {config.mode === 'online' && (
+   634→                  <div className="text-emerald-300/90 text-xs">Match recorded — check the leaderboard.</div>
+   635→                )}
+   636→              </div>
+   637→              <DialogFooter className="flex-row gap-2 sm:justify-between">
+   638→                <Button variant="outline" onClick={onViewLeaderboard} className="flex-1 border-white/20 bg-transparent text-white hover:bg-white/10">
+   639→                  Leaderboard
+   640→                </Button>
+   641→                <Button variant="outline" onClick={handleExit} className="flex-1 border-white/20 bg-transparent text-white hover:bg-white/10">
+   642→                  Menu
+   643→                </Button>
+   644→                {config.mode !== 'online' ? (
+   645→                  <Button onClick={handleRematch} className="flex-1 bg-emerald-600 hover:bg-emerald-700">
+   646→                    Rematch
+   647→                  </Button>
+   648→                ) : (
+   649→                  <Button onClick={handleRematch} disabled={waitingRematch} className="flex-1 bg-emerald-600 hover:bg-emerald-700">
+   650→                    {waitingRematch ? 'Waiting…' : 'Rematch'}
+   651→                  </Button>
+   652→                )}
+   653→              </DialogFooter>
+   654→            </>
+   655→          )}
+   656→        </DialogContent>
+   657→      </Dialog>
+   658→    </div>
+   659→  )
+   660→}
+   661→
+   662→function PlayerCard({
+   663→  name,
+   664→  rating,
+   665→  group,
+   666→  remaining,
+   667→  active,
+   668→  isMe,
+   669→  onBreak,
+   670→}: {
+   671→  name: string
+   672→  rating: number | null
+   673→  group: Group | null
+   674→  remaining: number
+   675→  active: boolean
+   676→  isMe: boolean
+   677→  onBreak: boolean
+   678→}) {
+   679→  return (
+   680→    <div
+   681→      className={`flex flex-1 items-center gap-2 rounded-lg border px-2 py-1.5 transition-colors sm:px-3 ${
+   682→        active ? 'border-amber-300/70 bg-amber-300/10 shadow-[0_0_14px_rgba(252,211,77,0.15)]' : 'border-white/10 bg-white/5'
+   683→      }`}
+   684→    >
+   685→      <div className="min-w-0 flex-1">
+   686→        <div className="flex items-center gap-1.5">
+   687→          <span className="truncate text-xs font-semibold sm:text-sm">{name}</span>
+   688→          {isMe && <span className="rounded bg-emerald-500/25 px-1 text-[9px] font-bold uppercase text-emerald-300">You</span>}
+   689→          {onBreak && active && <span className="rounded bg-white/15 px-1 text-[9px] font-bold uppercase text-white/70">Break</span>}
+   690→        </div>
+   691→        <div className="flex items-center gap-1.5 text-[10px] text-white/55 sm:text-[11px]">
+   692→          {rating !== null && <span>{rating} pts</span>}
+   693→          {group ? (
+   694→            <span className="capitalize">{group}s · {remaining} left</span>
+   695→          ) : (
+   696→            <span>{active ? 'Open table' : '—'}</span>
+   697→          )}
+   698→        </div>
+   699→      </div>
+   700→      <BallRow group={group} remaining={remaining} />
+   701→    </div>
+   702→  )
+   703→}
+   704→
+   705→function BallRow({ group, remaining }: { group: Group | null; remaining: number }) {
+   706→  if (!group) return <div className="w-3" />
+   707→  const total = 7
+   708→  return (
+   709→    <div className="flex w-9 flex-wrap gap-[3px] sm:w-12">
+   710→      {Array.from({ length: total }, (_, i) => (
+   711→        <Ball key={i} id={group === 'solid' ? i + 1 : i + 9} tiny faded={i >= remaining} />
+   712→      ))}
+   713→    </div>
+   714→  )
+   715→}
+   716→
+   717→function TinyBall({ id, tiny, faded }: { id: number; tiny?: boolean; faded?: boolean }) {
+   718→  void tiny
+   719→  const colors: Record<number, string> = {
+   720→    1: '#e8b323', 2: '#1c53c4', 3: '#d0342c', 4: '#6d3aa8', 5: '#e2762a', 6: '#1e7d46', 7: '#8c2c25',
+   721→    9: '#e8b323', 10: '#1c53c4', 11: '#d0342c', 12: '#6d3aa8', 13: '#e2762a', 14: '#1e7d46', 15: '#8c2c25',
+   722→  }
+   723→  return (
+   724→    <span
+   725→      className={`inline-block h-2.5 w-2.5 rounded-full border border-black/40 sm:h-3 sm:w-3 ${faded ? 'opacity-25' : ''}`}
+   726→      style={{ backgroundColor: colors[id] ?? '#888' }}
+   727→    />
+   728→  )
+   729→}
+   730→
+   731→const Ball = TinyBall
+   732→
+   733→function makePlayers(config: GameConfig, playerName: string, playerTwoName: string): [PlayerInfo, PlayerInfo] {
+   734→  if (config.mode === 'bot') {
+   735→    const difficulty = config.botDifficulty ?? 'medium'
+   736→    return [
+   737→      { name: playerName || 'You', isBot: false },
+   738→      { name: BOT_NAMES[difficulty] ?? 'Bot', isBot: true, difficulty },
+   739→    ]
+   740→  }
+   741→  if (config.mode === 'online') {
+   742→    return [
+   743→      { name: playerName || 'You', isBot: false },
+   744→      { name: config.online!.opponentName || 'Opponent', isBot: false },
+   745→    ]
+   746→  }
+   747→  return [
+   748→    { name: playerName || 'Player 1', isBot: false },
+   749→    { name: playerTwoName || 'Player 2', isBot: false },
+   750→  ]
+   751→}
+   752→
